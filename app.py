@@ -242,6 +242,5 @@ st.markdown(
 **Notes**
 - Years & geographies update automatically based on the dataset chosen.
 - County selector appears only when relevant (Geo = county or tract; requires selecting a State).
-- Want Excel download or a map view (with TIGER/Line)? I can add those.
 """
 )
