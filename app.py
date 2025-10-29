@@ -13,7 +13,7 @@ import streamlit as st
 # ---------------------------
 # Page setup
 # ---------------------------
-st.set_page_config(page_title="Census Data Dashboard by SHAH", layout="wide")
+st.set_page_config(page_title="Census Data Dashboard by Shah", layout="wide")
 
 # Embedded API key so end users don't need one
 API_KEY = "6c14346c155c7ae9110a833a854582dc60c3afd0"
