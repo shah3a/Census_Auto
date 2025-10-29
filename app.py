@@ -1,13 +1,8 @@
-# app.py — Census Data Dashboard (Streamlit, Option D)
-# Run locally:
-#   pip install -r requirements.txt
-#   streamlit run app.py
-#
-# Deploy on Streamlit Community Cloud:
-#   Push this file + requirements.txt to a GitHub repo and deploy.
+# app.py — Census Data Dashboard (Streamlit) — no separate search bar
+# Deploy: push app.py + requirements.txt to GitHub and deploy on Streamlit Cloud
+# or upload both files directly. No user API key needed.
 
-import os
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List
 from urllib.parse import urlencode
 
 import requests
@@ -24,7 +19,7 @@ st.set_page_config(page_title="Census Data Dashboard", layout="wide")
 API_KEY = "6c14346c155c7ae9110a833a854582dc60c3afd0"
 
 # ---------------------------
-# Dataset catalog (Option D)
+# Dataset catalog
 # ---------------------------
 DATASETS: List[Dict] = [
     {"label": "ACS 1-year", "slug": "acs/acs1", "years": list(range(2005, 2024)), "geos": ["nation", "state", "county", "tract"]},
@@ -35,15 +30,12 @@ DATASETS: List[Dict] = [
     {"label": "Decennial 2020 PL (Redistricting)", "slug": "dec/pl", "years": [2020], "geos": ["nation", "state", "county", "tract"]},
     {"label": "Population Estimates (PEP) — Total Pop", "slug": "pep/population", "years": list(range(2010, 2024)), "geos": ["nation", "state", "county"]},
 ]
-SLUG_TO_DEF: Dict[str, Dict] = {d["slug"]: d for d in DATASETS}
-
-# Reasonable dataset-specific default variables (if available)
 DEFAULT_VARS_BY_SLUG: Dict[str, List[str]] = {
-    "acs/acs1": ["B01003_001E"],  # Total population
+    "acs/acs1": ["B01003_001E"],   # Total population
     "acs/acs5": ["B01003_001E"],
-    "dec/pl":  ["P1_001N"],       # 2020 PL total pop
-    "dec/sf1": ["P001001"],       # 2010/2000/1990 SF1 total pop
-    "pep/population": ["POP"]     # PEP total pop
+    "dec/pl":  ["P1_001N"],        # 2020 PL total pop
+    "dec/sf1": ["P001001"],        # 2010/2000/1990 SF1 total pop
+    "pep/population": ["POP"],     # PEP total pop
 }
 
 # ---------------------------
@@ -140,7 +132,7 @@ def census_query(
 
     df = pd.DataFrame(data[1:], columns=data[0])
 
-    # Coerce numerics where appropriate
+    # Coerce numerics where possible
     for c in df.columns:
         if c not in {"NAME", "state", "county", "tract"}:
             df[c] = pd.to_numeric(df[c], errors="ignore")
@@ -162,29 +154,25 @@ def census_query(
     return df
 
 # ---------------------------
-# UI
+# UI (no separate search input)
 # ---------------------------
 st.title("Census Data Dashboard")
 
 left, right = st.columns([2.2, 1.0], gap="large")
 
 with left:
-    # Dataset selector
     ds_label = st.selectbox("Dataset", options=[d["label"] for d in DATASETS], index=1)
     ds = next(d for d in DATASETS if d["label"] == ds_label)
 
-    # Year & Geo adjust dynamically to dataset
     year = st.selectbox("Year", options=sorted(ds["years"], reverse=True))
     geo = st.selectbox("Geography", options=ds["geos"], index=1)
 
-    # Location widgets
     state_fips: Optional[str] = None
     county_fips: Optional[str] = None
 
     if geo in ("state", "county", "tract"):
         states_df = fetch_states(ds["slug"], year)
         state_choices = ["All States (*)"] + states_df["NAME"].tolist()
-        # default to Texas when available
         default_state_index = 0
         if "Texas" in states_df["NAME"].values:
             default_state_index = state_choices.index("Texas")
@@ -199,32 +187,18 @@ with left:
 
 with right:
     st.markdown("**API key embedded for all users:** ✅")
-    st.caption("Tip: Use the search box to find variables (e.g., “median income”, “poverty”, “B01003”).")
+    st.caption("Tip: Use the type-to-filter box inside the *Variables* dropdown to find items (e.g., “median income”, “poverty”, “B01003”).")
 
-# Variables search & multi-select
-vars_df = fetch_variables(ds["slug"], year)
-search = st.text_input("Search variables by name / label / concept", value="")
-if search:
-    m = (
-        vars_df["name"].str.contains(search, case=False, na=False)
-        | vars_df["label"].str.contains(search, case=False, na=False)
-        | vars_df["concept"].str.contains(search, case=False, na=False)
-    )
-    vars_filtered = vars_df[m]
-else:
-    vars_filtered = vars_df
-
-vars_filtered = vars_filtered.sort_values(["is_estimate_E", "name"], ascending=[False, True])
-
-# Build nice labels and default selection
-choices = [f"{r.name} — {r.label}" for r in vars_filtered.itertuples(index=False)]
-choice_to_var = dict(zip(choices, vars_filtered["name"]))
+# Variables (full list; multiselect has built-in search)
+vars_df = fetch_variables(ds["slug"], year).sort_values(["is_estimate_E", "name"], ascending=[False, True])
+choices = [f"{r.name} — {r.label}" for r in vars_df.itertuples(index=False)]
+choice_to_var = dict(zip(choices, vars_df["name"]))
 
 defaults = DEFAULT_VARS_BY_SLUG.get(ds["slug"], [])
-default_labels = [f"{v} — {vars_filtered.loc[vars_filtered['name'] == v, 'label'].iloc[0]}"
-                  for v in defaults if v in vars_filtered["name"].values]
+default_labels = [f"{v} — {vars_df.loc[vars_df['name'] == v, 'label'].iloc[0]}"
+                  for v in defaults if v in vars_df["name"].values]
 if not default_labels and choices:
-    default_labels = [choices[0]]  # fallback
+    default_labels = [choices[0]]
 
 selected_labels = st.multiselect("Variables", options=choices, default=default_labels, max_selections=80)
 selected_vars = [choice_to_var[c] for c in selected_labels]
@@ -245,15 +219,12 @@ if fetch:
 
     st.success(f"Got {len(df):,} rows.")
 
-    # Order columns for display/download
     value_cols = [c for c in df.columns if c not in ("NAME", "GEOID", "state", "county", "tract")]
     ordered_cols = ["NAME"] + value_cols + [c for c in ("state", "county", "tract", "GEOID") if c in df.columns]
     df_view = df[ordered_cols]
 
-    # Data table
     st.dataframe(df_view, use_container_width=True, height=420)
 
-    # Simple chart for state/county
     if value_cols and geo in ("state", "county") and len(df_view) > 1:
         metric = value_cols[0]
         plot_df = df_view.nlargest(50, metric).copy() if len(df_view) > 80 else df_view.copy()
@@ -261,18 +232,16 @@ if fetch:
         fig.update_layout(xaxis_title="", yaxis_title=metric, xaxis_tickangle=-45, height=480)
         st.plotly_chart(fig, use_container_width=True)
 
-    # Download CSV
     csv_bytes = df_view.to_csv(index=False).encode("utf-8")
     fname = f"census_{ds['slug'].replace('/', '_')}_{year}_{geo}.csv"
     st.download_button("Download CSV", data=csv_bytes, file_name=fname, mime="text/csv")
 
-# Footer tips
 st.markdown(
     """
 ---
 **Notes**
 - Years & geographies update automatically based on the dataset chosen.
 - County selector appears only when relevant (Geo = county or tract; requires selecting a State).
-- Need Excel download or a map view (with TIGER/Line)? I can add those.
+- Want Excel download or a map view (with TIGER/Line)? I can add those.
 """
 )
