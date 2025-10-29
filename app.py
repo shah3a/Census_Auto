@@ -13,7 +13,7 @@ import streamlit as st
 # ---------------------------
 # Page setup
 # ---------------------------
-st.set_page_config(page_title="Census Data Dashboard by Shah", layout="wide")
+#st.set_page_config(page_title="Census Data Dashboard by Shah", layout="wide")
 
 st.title("Census Data Dashboard — by Shah")
 
