@@ -12,6 +12,24 @@ from functools import lru_cache
 st.set_page_config(page_title="Census Data Dashboard — by SHAH", layout="wide")
 st.title("Census Data Dashboard — by Shah")
 
+# Put this near the top of app.py
+def clear_all_caches():
+    try:
+        get_years.cache_clear()
+        get_groups.cache_clear()
+        get_group_variables.cache_clear()
+        get_states.cache_clear()
+        get_counties.cache_clear()
+    except Exception:
+        pass
+
+with st.sidebar:
+    if st.button("🔄 Force refresh (clear caches)"):
+        clear_all_caches()
+        st.cache_data.clear()       # if you use st.cache_data anywhere
+        st.experimental_rerun()
+
+
 # ------------------------
 # Configuration
 # ------------------------
