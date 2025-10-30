@@ -1,247 +1,290 @@
-# app.py — Census Data Dashboard (Streamlit) — no separate search bar
-# Deploy: push app.py + requirements.txt to GitHub and deploy on Streamlit Cloud
-# or upload both files directly. No user API key needed.
-
-from typing import Optional, Dict, List
-from urllib.parse import urlencode
+# app.py — Census Data Dashboard with Variable Groups
+# Streamlit + US Census API
 
 import requests
 import pandas as pd
-import plotly.express as px
 import streamlit as st
+from functools import lru_cache
 
-# ---------------------------
+# ------------------------
 # Page setup
-# ---------------------------
-st.set_page_config(page_title="Census Data Dashboard by SHAH", layout="wide")
+# ------------------------
+st.set_page_config(page_title="Census Data Dashboard — by Shah", layout="wide")
+st.title("Census Data Dashboard — by Shah")
 
+# ------------------------
+# Configuration
+# ------------------------
+API_KEY = "6c14346c155c7ae9110a833a854582dc60c3afd0"   # embedded so users don't need one
 
-# Embedded API key so end users don't need one
-API_KEY = "6c14346c155c7ae9110a833a854582dc60c3afd0"
-
-# ---------------------------
-# Dataset catalog
-# ---------------------------
-DATASETS: List[Dict] = [
-    {"label": "ACS 1-year", "slug": "acs/acs1", "years": list(range(2005, 2024)), "geos": ["nation", "state", "county", "tract"]},
-    {"label": "ACS 5-year", "slug": "acs/acs5", "years": list(range(2009, 2024)), "geos": ["nation", "state", "county", "tract"]},
-    {"label": "Decennial 1990 SF1", "slug": "dec/sf1", "years": [1990], "geos": ["nation", "state", "county", "tract"]},
-    {"label": "Decennial 2000 SF1", "slug": "dec/sf1", "years": [2000], "geos": ["nation", "state", "county", "tract"]},
-    {"label": "Decennial 2010 SF1", "slug": "dec/sf1", "years": [2010], "geos": ["nation", "state", "county", "tract"]},
-    {"label": "Decennial 2020 PL (Redistricting)", "slug": "dec/pl", "years": [2020], "geos": ["nation", "state", "county", "tract"]},
-    {"label": "Population Estimates (PEP) — Total Pop", "slug": "pep/population", "years": list(range(2010, 2024)), "geos": ["nation", "state", "county"]},
-]
-DEFAULT_VARS_BY_SLUG: Dict[str, List[str]] = {
-    "acs/acs1": ["B01003_001E"],   # Total population
-    "acs/acs5": ["B01003_001E"],
-    "dec/pl":  ["P1_001N"],        # 2020 PL total pop
-    "dec/sf1": ["P001001"],        # 2010/2000/1990 SF1 total pop
-    "pep/population": ["POP"],     # PEP total pop
+# Datasets you want to expose in the UI
+DATASETS = {
+    "ACS 1-year": "acs/acs1",
+    "ACS 5-year": "acs/acs5",
+    "Decennial 2010 SF1": "dec/sf1",
 }
 
-# ---------------------------
-# Cached helpers
-# ---------------------------
-@st.cache_data(show_spinner=False)
-def fetch_variables(dataset_slug: str, year: int) -> pd.DataFrame:
-    """Return variables.json as a DataFrame with helpful flags."""
-    url = f"https://api.census.gov/data/{year}/{dataset_slug}/variables.json"
-    r = requests.get(url, timeout=60)
+# A tiny map to make some common codes read nicely in the table header
+COMMON_CODE_NAMES = {
+    "NAME": "Name",
+    "state": "State FIPS",
+    "county": "County FIPS",
+    "tract": "Tract FIPS",
+    "GEOID": "GEOID",
+}
+
+# ------------------------
+# Helpers (cached)
+# ------------------------
+def api_base(year: int, dataset_path: str) -> str:
+    return f"https://api.census.gov/data/{year}/{dataset_path}"
+
+@lru_cache(maxsize=128)
+def get_years(dataset_path: str) -> list[int]:
+    """Return available years that actually exist for this dataset."""
+    # We discover years by probing the API /variables endpoint backwards from 2025.
+    candidates = list(range(2025, 2009, -1))  # 2025..2010
+    exists = []
+    for y in candidates:
+        url = f"{api_base(y, dataset_path)}/variables.json"
+        r = requests.get(url, timeout=20)
+        if r.status_code == 200:
+            exists.append(y)
+    exists.sort(reverse=True)
+    return exists
+
+@lru_cache(maxsize=128)
+def get_groups(year: int, dataset_path: str) -> pd.DataFrame:
+    """Return the groups (code + description) for a dataset/year."""
+    url = f"{api_base(year, dataset_path)}/groups.json"
+    r = requests.get(url, timeout=30)
     r.raise_for_status()
-    data = r.json()
+    js = r.json()
+    # groups is a dict keyed by group name with description, name, variables, etc.
     rows = []
-    for name, meta in data.get("variables", {}).items():
+    for gcode, ginfo in js.get("groups", {}).items():
         rows.append({
-            "name": name,
-            "label": meta.get("label", ""),
-            "concept": meta.get("concept", ""),
-            "is_estimate_E": str(name).endswith("E"),
+            "group_code": gcode,                         # e.g., "B01001"
+            "name": ginfo.get("name", gcode),            # e.g., "SEX BY AGE"
+            "description": ginfo.get("description", ""), # often nicer sentence
         })
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows).sort_values("group_code").reset_index(drop=True)
     return df
 
-@st.cache_data(show_spinner=False)
-def fetch_states(dataset_slug: str, year: int) -> pd.DataFrame:
-    base = f"https://api.census.gov/data/{year}/{dataset_slug}"
-    params = {"get": "NAME", "for": "state:*"}
-    if API_KEY:
-        params["key"] = API_KEY
-    r = requests.get(base, params=params, timeout=60)
+@lru_cache(maxsize=256)
+def get_group_variables(year: int, dataset_path: str, group_code: str) -> pd.DataFrame:
+    """Return the variables within a specific group."""
+    url = f"{api_base(year, dataset_path)}/groups/{group_code}.json"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    js = r.json()
+    vars_dict = js.get("variables", {})
+    rows = []
+    for vid, vinfo in vars_dict.items():
+        label = vinfo.get("label", "")
+        concept = vinfo.get("concept", "")
+        if vid.endswith("EA"):  # avoid annotations; keep *_E/_M/main only
+            continue
+        rows.append({
+            "id": vid,
+            "label": label,
+            "concept": concept,
+        })
+    df = pd.DataFrame(rows).sort_values("id").reset_index(drop=True)
+    return df
+
+@lru_cache(maxsize=256)
+def get_states(year: int, dataset_path: str) -> pd.DataFrame:
+    url = f"{api_base(year, dataset_path)}?get=NAME&for=state:*"
+    r = requests.get(url, timeout=30)
     r.raise_for_status()
     data = r.json()
-    return pd.DataFrame(data[1:], columns=data[0]).rename(columns={"state": "state_fips"})
-
-@st.cache_data(show_spinner=False)
-def fetch_counties(dataset_slug: str, year: int, state_fips: str) -> pd.DataFrame:
-    base = f"https://api.census.gov/data/{year}/{dataset_slug}"
-    params = {"get": "NAME", "for": "county:*", "in": f"state:{state_fips}"}
-    if API_KEY:
-        params["key"] = API_KEY
-    r = requests.get(base, params=params, timeout=60)
-    r.raise_for_status()
-    data = r.json()
-    return (
-        pd.DataFrame(data[1:], columns=data[0])
-        .rename(columns={"county": "county_fips", "state": "state_fips"})
-    )
-
-@st.cache_data(show_spinner=False)
-def census_query(
-    dataset_slug: str,
-    year: int,
-    variables: List[str],
-    geo_level: str,
-    state_fips: Optional[str] = None,
-    county_fips: Optional[str] = None,
-) -> pd.DataFrame:
-    """Query the Census API and return results as DataFrame."""
-    base = f"https://api.census.gov/data/{year}/{dataset_slug}"
-
-    # Build geo clauses
-    if geo_level == "nation":
-        for_clause, in_clause = "us:1", None
-    elif geo_level == "state":
-        if state_fips and state_fips != "*":
-            for_clause, in_clause = f"state:{state_fips}", None
-        else:
-            for_clause, in_clause = "state:*", None
-    elif geo_level == "county":
-        if not state_fips:
-            raise ValueError("State is required for county queries.")
-        if county_fips and county_fips != "*":
-            for_clause, in_clause = f"county:{county_fips}", f"state:{state_fips}"
-        else:
-            for_clause, in_clause = "county:*", f"state:{state_fips}"
-    elif geo_level == "tract":
-        if not (state_fips and county_fips):
-            raise ValueError("State and County are required for tract queries.")
-        for_clause, in_clause = "tract:*", f"state:{state_fips}+county:{county_fips}"
-    else:
-        raise ValueError("Unsupported geo level")
-
-    get_vars = ["NAME"] + (variables or [])
-    params = {"get": ",".join(get_vars), "for": for_clause}
-    if in_clause:
-        params["in"] = in_clause
-    if API_KEY:
-        params["key"] = API_KEY
-
-    url = base + "?" + urlencode(params)
-    r = requests.get(url, timeout=120)
-    r.raise_for_status()
-    data = r.json()
-
     df = pd.DataFrame(data[1:], columns=data[0])
+    df["state_name"] = df["NAME"]
+    df["state_fips"] = df["state"]
+    return df[["state_name", "state_fips"]].sort_values("state_name")
 
-    # Coerce numerics where possible
-    for c in df.columns:
-        if c not in {"NAME", "state", "county", "tract"}:
-            df[c] = pd.to_numeric(df[c], errors="ignore")
+@lru_cache(maxsize=256)
+def get_counties(year: int, dataset_path: str, state_fips: str) -> pd.DataFrame:
+    url = f"{api_base(year, dataset_path)}?get=NAME&for=county:*&in=state:{state_fips}"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    df = pd.DataFrame(data[1:], columns=data[0])
+    df["county_name"] = df["NAME"]
+    df["county_fips"] = df["county"]
+    return df[["county_name", "county_fips"]].sort_values("county_name")
 
-    # Compose GEOID
-    if geo_level == "nation":
-        df["GEOID"] = "0100000US"
-    elif geo_level == "state":
-        df["GEOID"] = "0400000US" + df["state"].astype(str).str.zfill(2)
-    elif geo_level == "county":
-        df["GEOID"] = "0500000US" + df["state"].astype(str).str.zfill(2) + df["county"].astype(str).str.zfill(3)
-    elif geo_level == "tract":
-        df["GEOID"] = (
-            "1400000US"
-            + df["state"].astype(str).str.zfill(2)
-            + df["county"].astype(str).str.zfill(3)
-            + df["tract"].astype(str).str.zfill(6)
-        )
+def friendly_header(col: str) -> str:
+    return COMMON_CODE_NAMES.get(col, col)
+
+def prettify_label(vrow) -> str:
+    """Make the variable label shorter but readable."""
+    label = vrow["label"]
+    concept = vrow["concept"]
+    # Replace weird '!!' patterns with arrows and collapse extra bangs
+    short = label.replace("!!", " → ").replace("  ", " ")
+    return f'{vrow["id"]} — {short}'
+
+# ------------------------
+# Query builder & fetch
+# ------------------------
+def build_where(geo: str, state_fips: str | None, county_fips: str | None):
+    if geo == "nation":
+        return {"for": "us:1"}, None
+    if geo == "state":
+        if state_fips and state_fips != "*":
+            return {"for": f"state:{state_fips}"}, None
+        else:
+            return {"for": "state:*"}, None
+    if geo == "county":
+        if not state_fips or state_fips == "*":
+            raise ValueError("Select a State for county geography.")
+        if county_fips and county_fips != "*":
+            return {"for": f"county:{county_fips}", "in": f"state:{state_fips}"}, None
+        else:
+            return {"for": "county:*", "in": f"state:{state_fips}"}, None
+    if geo == "tract":
+        if not state_fips or not county_fips or state_fips == "*" or county_fips == "*":
+            raise ValueError("Select a specific State and County for tract geography.")
+        return {"for": "tract:*", "in": f"state:{state_fips} county:{county_fips}"}, None
+    raise ValueError("Unsupported geography.")
+
+def census_fetch(year: int,
+                 dataset_path: str,
+                 variables: list[str],
+                 geo: str,
+                 state_fips: str | None,
+                 county_fips: str | None) -> pd.DataFrame:
+    base = api_base(year, dataset_path)
+    params, _ = build_where(geo, state_fips, county_fips)
+    var_list = ",".join(["NAME"] + variables)
+    params = {"get": var_list, **(params or {}), "key": API_KEY}
+    r = requests.get(base, params=params, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    df = pd.DataFrame(data[1:], columns=data[0])
+    # Add GEOID where appropriate
+    if "state" in df.columns and "county" in df.columns and "tract" in df.columns:
+        df["GEOID"] = df["state"] + df["county"] + df["tract"]
+    elif "state" in df.columns and "county" in df.columns:
+        df["GEOID"] = df["state"] + df["county"]
+    elif "state" in df.columns:
+        df["GEOID"] = df["state"]
+    # Order columns
+    leading = ["NAME"] + [c for c in ["state", "county", "tract", "GEOID"] if c in df.columns]
+    rest = [c for c in df.columns if c not in leading]
+    df = df[leading + rest]
+    df = df.rename(columns={c: friendly_header(c) for c in df.columns})
     return df
 
-# ---------------------------
-# UI (no separate search input)
-# ---------------------------
-st.title("Census Data Dashboard")
+# ------------------------
+# Sidebar / Controls
+# ------------------------
+colA, colB = st.columns([1, 1])
 
-left, right = st.columns([2.2, 1.0], gap="large")
+with colA:
+    dataset_label = st.selectbox("Dataset", list(DATASETS.keys()), index=0)
+    dataset_path = DATASETS[dataset_label]
 
-with left:
-    ds_label = st.selectbox("Dataset", options=[d["label"] for d in DATASETS], index=1)
-    ds = next(d for d in DATASETS if d["label"] == ds_label)
+    years = get_years(dataset_path)
+    if not years:
+        st.stop()
+    year = st.selectbox("Year", years, index=0)
 
-    year = st.selectbox("Year", options=sorted(ds["years"], reverse=True))
-    geo = st.selectbox("Geography", options=ds["geos"], index=1)
+    geo = st.selectbox("Geography", ["nation", "state", "county", "tract"], index=1)
 
-    state_fips: Optional[str] = None
-    county_fips: Optional[str] = None
+with colB:
+    # State & County controls (show only when relevant)
+    state_fips = None
+    county_fips = None
 
     if geo in ("state", "county", "tract"):
-        states_df = fetch_states(ds["slug"], year)
-        state_choices = ["All States (*)"] + states_df["NAME"].tolist()
-        default_state_index = 0
-        if "Texas" in states_df["NAME"].values:
-            default_state_index = state_choices.index("Texas")
-        state_choice = st.selectbox("State", options=state_choices, index=max(0, default_state_index))
-        state_fips = "*" if state_choice == "All States (*)" else states_df.loc[states_df["NAME"] == state_choice, "state_fips"].iloc[0]
+        states_df = get_states(year, dataset_path)
+        state_display = ["All States (*)"] + [f'{r.state_name} ({r.state_fips})' for r in states_df.itertuples()]
+        chosen_state = st.selectbox("State", state_display, index=0)
+        if chosen_state.startswith("All States"):
+            state_fips = "*"
+        else:
+            state_fips = chosen_state.split("(")[-1].strip(")")
 
     if geo in ("county", "tract") and state_fips and state_fips != "*":
-        counties_df = fetch_counties(ds["slug"], year, state_fips)
-        county_choices = ["All Counties (*)"] + counties_df["NAME"].tolist()
-        county_choice = st.selectbox("County", options=county_choices, index=0)
-        county_fips = "*" if county_choice == "All Counties (*)" else counties_df.loc[counties_df["NAME"] == county_choice, "county_fips"].iloc[0]
+        counties_df = get_counties(year, dataset_path, state_fips)
+        county_display = ["All Counties (*)"] + [f'{r.county_name} ({r.county_fips})' for r in counties_df.itertuples()]
+        chosen_county = st.selectbox("County", county_display, index=0)
+        if chosen_county.startswith("All Counties"):
+            county_fips = "*"
+        else:
+            county_fips = chosen_county.split("(")[-1].strip(")")
 
-with right:
-    st.markdown("**API key embedded for all users:** ✅")
-    st.caption("Tip: Use the type-to-filter box inside the *Variables* dropdown to find items (e.g., “median income”, “poverty”, “B01003”).")
+# --- Group → Variables cascade ---
+groups_df = get_groups(year, dataset_path)
+group_options = [f'{r.group_code} — {r.description or r.name}' for r in groups_df.itertuples()]
+st.markdown("#### Variables")
+group_choice = st.selectbox("Variable group", group_options, index=0, help="Pick a group, then choose variables from that group.")
 
-# Variables (full list; multiselect has built-in search)
-vars_df = fetch_variables(ds["slug"], year).sort_values(["is_estimate_E", "name"], ascending=[False, True])
-choices = [f"{r.name} — {r.label}" for r in vars_df.itertuples(index=False)]
-choice_to_var = dict(zip(choices, vars_df["name"]))
+selected_group = group_choice.split(" — ")[0] if group_choice else None
 
-defaults = DEFAULT_VARS_BY_SLUG.get(ds["slug"], [])
-default_labels = [f"{v} — {vars_df.loc[vars_df['name'] == v, 'label'].iloc[0]}"
-                  for v in defaults if v in vars_df["name"].values]
-if not default_labels and choices:
-    default_labels = [choices[0]]
+vars_df = pd.DataFrame()
+if selected_group:
+    vars_df = get_group_variables(year, dataset_path, selected_group)
+    # Pretty labels for UI
+    vars_df["pretty"] = vars_df.apply(prettify_label, axis=1)
 
-selected_labels = st.multiselect("Variables", options=choices, default=default_labels, max_selections=80)
-selected_vars = [choice_to_var[c] for c in selected_labels]
+selected_vars_pretty = st.multiselect(
+    "Variables",
+    options=list(vars_df["pretty"]) if not vars_df.empty else [],
+    max_selections=80,
+    help="Type to filter within this group."
+)
 
-# Fetch button
-fetch = st.button("Fetch data", type="primary")
+selected_var_ids = list(vars_df.loc[vars_df["pretty"].isin(selected_vars_pretty), "id"]) if not vars_df.empty else []
 
-if fetch:
-    if not selected_vars:
-        st.warning("Select at least one variable.")
+# Link to the group's API page (handy)
+if selected_group:
+    st.caption(
+        f"[Open Census API group page for {selected_group}]({api_base(year, dataset_path)}/groups/{selected_group}.json)"
+    )
+
+# ------------------------
+# Fetch
+# ------------------------
+if st.button("Fetch data", type="primary"):
+    if not selected_var_ids:
+        st.warning("Pick at least one variable.")
         st.stop()
-
     try:
-        df = census_query(ds["slug"], year, selected_vars, geo, state_fips, county_fips)
+        df = census_fetch(year, dataset_path, selected_var_ids, geo, state_fips, county_fips)
+        st.success(f"Got {len(df):,} rows.")
+        st.dataframe(df, use_container_width=True, height=480)
+
+        # simple profile chart when possible
+        if geo in ("state", "county") and len(selected_var_ids) == 1 and len(df) > 1:
+            import plotly.express as px
+            metric = selected_var_ids[0]
+            fig = px.bar(
+                df,
+                x="Name",
+                y=metric,
+                title=f"{metric} by {geo}",
+                labels={"Name": geo.capitalize()},
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        # Download CSV
+        csv = df.to_csv(index=False).encode("utf-8")
+        fname = f"{dataset_label.replace(' ', '_')}_{year}_{geo}.csv"
+        st.download_button("Download CSV", data=csv, file_name=fname, mime="text/csv")
+
     except Exception as e:
-        st.error(f"API error: {e}")
-        st.stop()
+        st.error(f"Fetch failed: {e}")
 
-    st.success(f"Got {len(df):,} rows.")
-
-    value_cols = [c for c in df.columns if c not in ("NAME", "GEOID", "state", "county", "tract")]
-    ordered_cols = ["NAME"] + value_cols + [c for c in ("state", "county", "tract", "GEOID") if c in df.columns]
-    df_view = df[ordered_cols]
-
-    st.dataframe(df_view, use_container_width=True, height=420)
-
-    if value_cols and geo in ("state", "county") and len(df_view) > 1:
-        metric = value_cols[0]
-        plot_df = df_view.nlargest(50, metric).copy() if len(df_view) > 80 else df_view.copy()
-        fig = px.bar(plot_df, x="NAME", y=metric, title=f"Top {len(plot_df)} by {metric}")
-        fig.update_layout(xaxis_title="", yaxis_title=metric, xaxis_tickangle=-45, height=480)
-        st.plotly_chart(fig, use_container_width=True)
-
-    csv_bytes = df_view.to_csv(index=False).encode("utf-8")
-    fname = f"census_{ds['slug'].replace('/', '_')}_{year}_{geo}.csv"
-    st.download_button("Download CSV", data=csv_bytes, file_name=fname, mime="text/csv")
-
-st.markdown(
-    """
----
+# ------------------------
+# Notes
+# ------------------------
+st.markdown("""
 **Notes**
 - Years & geographies update automatically based on the dataset chosen.
-- County selector appears only when relevant (Geo = county or tract; requires selecting a State).
-"""
-)
+- For **county** and **tract**, pick a **State** first (and a **County** for tracts).
+- Variable selection is now **grouped**—choose a **group** first to declutter the list.
+""")
