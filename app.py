@@ -9,7 +9,7 @@ from functools import lru_cache
 # ------------------------
 # Page setup
 # ------------------------
-st.set_page_config(page_title="Census Data Dashboard — by Shah", layout="wide")
+st.set_page_config(page_title="Census Data Dashboard — by SHAH", layout="wide")
 st.title("Census Data Dashboard — by Shah")
 
 # ------------------------
